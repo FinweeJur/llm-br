@@ -28,11 +28,18 @@ class AnthropicProvider(LLMProvider):
 
     def chat(self, mensagens: list[Mensagem], **kwargs) -> RespostaLLM:
         system, resto = separar_system(mensagens)
+        extra = {}
+        # Só enviamos temperature quando pedida: omitir deixa o default da API,
+        # e mandar 0.2 "por via das dúvidas" mudaria silenciosamente o
+        # comportamento de quem hoje não passa nada.
+        if "temperatura" in kwargs:
+            extra["temperature"] = kwargs["temperatura"]
         msg = self._client().messages.create(
             model=self.modelo,
             max_tokens=kwargs.get("max_tokens", PADRAO_MAX_TOKENS),
             system=system or None,
             messages=[{"role": m.role, "content": m.content} for m in resto],
+            **extra,
         )
         return RespostaLLM(
             texto=msg.content[0].text,
@@ -52,10 +59,8 @@ class AnthropicProvider(LLMProvider):
             yield from stream.text_stream
 
     def gerar_texto(self, prompt: str, *, system: str = "", temperatura: float = 0.2) -> str:
-        return self.chat(
-            [Mensagem("system", system), Mensagem("user", prompt)] if system
-            else [Mensagem("user", prompt)]
-        ).texto.strip()
+        mensagens = ([Mensagem("system", system)] if system else []) + [Mensagem("user", prompt)]
+        return self.chat(mensagens, temperatura=temperatura).texto.strip()
 
     def gerar_json(self, prompt: str, *, system: str = "", temperatura: float = 0.0) -> dict:
         # A API não tem modo JSON nativo; pedimos no system e validamos na saída.

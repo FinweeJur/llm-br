@@ -86,6 +86,20 @@ class LLMProvider:
         yield self.chat(mensagens, **kwargs).texto
 
     # ── opcionais ───────────────────────────────────────────────────
+    def chat_com_tools(self, system: str, historico: list[Mensagem], user_text: str,
+                       tools: list[dict], executar, max_iters: int = 5) -> dict:
+        """Loop de tool-calling. Nem todo provedor implementa.
+
+        Falha com mensagem explícita em vez de AttributeError: quem chama
+        costuma ser um agente que já escolheu o provedor por variável de
+        ambiente, e um erro opaco aqui manda o dedo para o lugar errado.
+        Cheque antes com `suporta("tools")`.
+        """
+        raise LLMError(
+            f"provedor {self.nome!r} não suporta tool-calling. "
+            f"Use suporta('tools') antes de chamar, ou troque de provedor."
+        )
+
     def embeddings(self, textos: list[str]) -> list[list[float]] | None:
         """Vetores de significado, para RAG. `None` quando indisponível.
 
@@ -149,12 +163,16 @@ def extrair_json(texto: str) -> dict:
 
 def com_retentativa(
     func: Callable[[], Any], *, tentativas: int = 3, espera_inicial: float = 2.0,
-    espera_maxima: float = 30.0, dormir: Callable[[float], None] = time.sleep,
+    espera_maxima: float = 30.0, dormir: Callable[[float], None] | None = None,
 ) -> Any:
     """Repete `func` com espera exponencial. Sem dependência externa.
 
-    `dormir` é injetável para que os testes não gastem tempo real.
+    `dormir` é injetável para que os testes não gastem tempo real. Resolvido
+    aqui dentro, e não como valor default do parâmetro: default é avaliado na
+    definição do módulo, o que congelaria `time.sleep` e faria um
+    `patch("llm_br.base.time.sleep")` não ter efeito nenhum.
     """
+    dormir = dormir or time.sleep
     espera = espera_inicial
     for tentativa in range(1, tentativas + 1):
         try:

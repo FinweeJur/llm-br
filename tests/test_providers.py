@@ -36,7 +36,8 @@ class TestOllama:
     def test_servico_fora_do_ar_vira_LLMError_com_a_url(self):
         import requests
 
-        with patch("requests.post", side_effect=requests.RequestException("recusou")):
+        with patch("requests.post", side_effect=requests.RequestException("recusou")), \
+             patch("llm_br.base.time.sleep"):
             with pytest.raises(LLMError) as exc:
                 OllamaProvider("m", "http://maquina:11434").gerar_texto("p")
         assert "maquina:11434" in str(exc.value)
@@ -45,7 +46,8 @@ class TestOllama:
         """RAG é opcional: o chamador precisa poder cair na busca simples."""
         import requests
 
-        with patch("requests.post", side_effect=requests.RequestException("fora")):
+        with patch("requests.post", side_effect=requests.RequestException("fora")), \
+             patch("llm_br.base.time.sleep"):
             assert OllamaProvider("m").embeddings(["a"]) is None
 
     def test_embeddings_usa_o_modelo_de_embeddings_e_nao_o_de_chat(self):
@@ -137,3 +139,91 @@ class TestOpenAICompat:
         enviadas = post.call_args.kwargs["json"]["messages"]
         assert enviadas[0] == {"role": "system", "content": "seja breve"}
         assert enviadas[1]["content"] == "oi"
+
+
+class TestOllamaRobustez:
+    """Comportamentos herdados da implementação do Congresso ao propagar a lib.
+    Sem eles a migração daquele projeto seria regressão."""
+
+    def test_modelo_ausente_diz_como_resolver(self):
+        with patch("requests.post", return_value=resposta(status=404)):
+            with pytest.raises(LLMError) as exc:
+                OllamaProvider("llama3.1:8b").gerar_texto("p")
+        assert "ollama pull llama3.1:8b" in str(exc.value)
+
+    def test_modelo_ausente_nao_e_retentado(self):
+        """Baixar o modelo é ação humana — insistir só atrasa o erro."""
+        with patch("requests.post", return_value=resposta(status=404)) as post:
+            with pytest.raises(LLMError):
+                OllamaProvider("m").gerar_texto("p")
+        assert post.call_count == 1
+
+    def test_falha_transitoria_e_retentada(self):
+        respostas = [resposta(status=503, text="carregando modelo"),
+                     resposta(json_data={"response": "consegui"})]
+        with patch("requests.post", side_effect=respostas), patch("llm_br.base.time.sleep"):
+            assert OllamaProvider("m").gerar_texto("p") == "consegui"
+
+    def test_servico_fora_do_ar_e_retentado_e_depois_desiste(self):
+        import requests as _r
+
+        with patch("requests.post", side_effect=_r.RequestException("recusou")) as post, \
+             patch("llm_br.base.time.sleep"):
+            with pytest.raises(LLMError):
+                OllamaProvider("m").gerar_texto("p")
+        assert post.call_count == 3
+
+
+class TestAchadosDaRevisao:
+    """Defeitos encontrados na revisão de código da propagação (2026-07-22)."""
+
+    def test_provedor_sem_tools_falha_com_mensagem_e_nao_AttributeError(self):
+        """agent.responder() do Ygg chamava chat_com_tools sem checar suporte;
+        com LLM_PROVIDER=deepseek isso estourava 'super object has no
+        attribute', que aponta o dedo para o lugar errado."""
+        p = OpenAICompatProvider("m", "https://x", "k")
+        assert p.suporta("tools") is False
+        with pytest.raises(LLMError) as exc:
+            p.chat_com_tools("s", [], "oi", [], lambda n, **k: {})
+        assert "não suporta tool-calling" in str(exc.value)
+
+    def test_stream_do_ollama_checa_o_status_antes_de_ler(self):
+        """Um 404 caía no iter_lines e estourava como erro de parse de JSON."""
+        r = resposta(status=404)
+        r.iter_lines.return_value = [b"not json"]
+        with patch("requests.post", return_value=r):
+            with pytest.raises(LLMError) as exc:
+                list(OllamaProvider("llama3.1").stream([Mensagem("user", "oi")]))
+        assert "ollama pull llama3.1" in str(exc.value)
+
+
+class TestTemperaturaAnthropic:
+    """gerar_json(temperatura=0.0) prometia determinismo e a temperatura era
+    descartada no caminho do Anthropic."""
+
+    def _provider(self):
+        from llm_br.providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider("claude-x", api_key="k")
+
+    def test_temperatura_chega_na_api(self):
+        fake = MagicMock()
+        fake.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="ok")], stop_reason="end_turn"
+        )
+        p = self._provider()
+        with patch.object(p, "_client", return_value=fake):
+            p.gerar_texto("p", temperatura=0.0)
+        assert fake.messages.create.call_args.kwargs["temperature"] == 0.0
+
+    def test_chat_sem_temperatura_nao_envia_o_campo(self):
+        """Omitir preserva o default da API — mandar 0.2 por via das dúvidas
+        mudaria silenciosamente quem hoje não passa nada."""
+        fake = MagicMock()
+        fake.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="ok")], stop_reason="end_turn"
+        )
+        p = self._provider()
+        with patch.object(p, "_client", return_value=fake):
+            p.chat([Mensagem("user", "oi")])
+        assert "temperature" not in fake.messages.create.call_args.kwargs

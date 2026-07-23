@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Iterator
 
-from ..base import LLMError, LLMProvider, Mensagem, RespostaLLM, extrair_json
+from ..base import LLMError, LLMProvider, Mensagem, RespostaLLM, com_retentativa, extrair_json
 
 PADRAO_HOST = "http://localhost:11434"
 
@@ -27,15 +27,28 @@ class OllamaProvider(LLMProvider):
     def _post(self, rota: str, payload: dict, timeout: int | None = None) -> dict:
         import requests
 
-        try:
-            resp = requests.post(
-                f"{self.base_url}{rota}", json=payload, timeout=timeout or self.timeout
-            )
-        except requests.RequestException as e:
-            raise LLMError(f"Ollama inacessível em {self.base_url}: {e}") from e
-        if resp.status_code >= 400:
-            raise LLMError(f"Ollama respondeu {resp.status_code}: {resp.text[:200]}")
-        return resp.json()
+        def uma_tentativa() -> dict:
+            try:
+                resp = requests.post(
+                    f"{self.base_url}{rota}", json=payload, timeout=timeout or self.timeout
+                )
+            except requests.RequestException as e:
+                raise LLMError(f"Ollama inacessível em {self.base_url}: {e}") from e
+
+            if resp.status_code == 404:
+                # Modelo ausente não melhora com retentativa, e a mensagem
+                # precisa dizer o que fazer — senão vira meia hora de debug.
+                erro = LLMError(
+                    f"modelo {self.modelo!r} não existe no Ollama. "
+                    f"Rode: ollama pull {self.modelo}"
+                )
+                erro.reententavel = False
+                raise erro
+            if resp.status_code >= 400:
+                raise LLMError(f"Ollama respondeu {resp.status_code}: {resp.text[:200]}")
+            return resp.json()
+
+        return com_retentativa(uma_tentativa)
 
     # ── nível tarefa ────────────────────────────────────────────────
     def _gerar(self, prompt: str, system: str, temperatura: float, formato: str | None) -> str:
@@ -85,6 +98,17 @@ class OllamaProvider(LLMProvider):
             )
         except requests.RequestException as e:
             raise LLMError(f"Ollama inacessível em {self.base_url}: {e}") from e
+
+        # Sem esta checagem, um 404 cairia no iter_lines abaixo e estouraria
+        # como erro de parse de JSON — escondendo a causa real.
+        if resp.status_code == 404:
+            raise LLMError(
+                f"modelo {self.modelo!r} não existe no Ollama. "
+                f"Rode: ollama pull {self.modelo}"
+            )
+        if resp.status_code >= 400:
+            raise LLMError(f"Ollama respondeu {resp.status_code} ao abrir o stream.")
+
         for linha in resp.iter_lines():
             if not linha:
                 continue
